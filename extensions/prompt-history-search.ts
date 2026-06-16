@@ -1,12 +1,16 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	CustomEditor,
+	getAgentDir,
+	parseSessionEntries,
+	SessionManager,
 	type AppKeybinding,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
+	type SessionEntry,
+	type SessionHeader,
 } from "@mariozechner/pi-coding-agent";
 import {
 	Key,
@@ -18,57 +22,127 @@ import {
 	type TUI,
 } from "@mariozechner/pi-tui";
 
-const HISTORY_FILE = path.join(os.homedir(), ".pi", "agent", "prompt-history.json");
-const MAX_HISTORY = 2000;
+const AGENT_DIR = getAgentDir();
+const INDEX_FILE = path.join(AGENT_DIR, "prompt-history-index.jsonl");
+const GLOBAL_CONFIG_FILE = path.join(AGENT_DIR, "prompt-history-search.json");
+const PROJECT_CONFIG_FILE = path.join(".pi", "prompt-history-search.json");
+
+type PromptHistoryScope = "all" | "current-session";
+
+type PromptHistoryConfig = {
+	scope: PromptHistoryScope;
+};
+
+const DEFAULT_CONFIG: PromptHistoryConfig = {
+	scope: "all",
+};
+
 type PromptHistoryEntry = {
 	text: string;
 	timestamp: number;
 	cwd?: string;
+	sessionFile?: string;
+	sessionId?: string;
+	entryId?: string;
 };
+
+type PromptHistoryIndexRecord =
+	| {
+			type: "meta";
+			version: 3;
+			createdAt: number;
+			updatedAt: number;
+	  }
+	| ({ type: "message" } & PromptHistoryEntry);
 
 type CustomEditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
 
-type PromptHistoryFile = {
-	version: 1;
-	entries: PromptHistoryEntry[];
-};
-
 class PromptHistoryStore {
 	private entries: PromptHistoryEntry[] = [];
+	private config: PromptHistoryConfig = DEFAULT_CONFIG;
+	private activeSessionFile: string | undefined;
+	private activeSessionId: string | undefined;
+	private activeCwd: string | undefined;
 
-	constructor(private readonly file: string) {
+	constructor(private readonly indexFile: string) {
 		this.load();
 	}
 
-	add(text: string, cwd?: string, options?: { persist?: boolean }): boolean {
-		const normalized = this.normalize(text);
-		if (!normalized) return false;
+	configure(cwd: string): void {
+		this.config = loadConfig(cwd);
+	}
 
-		const existing = this.entries.findIndex((entry) => entry.text === normalized);
-		if (existing >= 0) this.entries.splice(existing, 1);
+	setActiveSession(ctx: ExtensionContext): void {
+		this.activeSessionFile = ctx.sessionManager.getSessionFile();
+		this.activeSessionId = ctx.sessionManager.getSessionId();
+		this.activeCwd = ctx.cwd;
+	}
 
-		this.entries.push({ text: normalized, timestamp: Date.now(), cwd });
-		this.trim();
+	hasIndex(): boolean {
+		return fs.existsSync(this.indexFile);
+	}
+
+	async ensureIndex(): Promise<boolean> {
+		if (this.hasIndex()) {
+			this.load();
+			return false;
+		}
+
+		await this.rebuildFromAllSessions();
+		return true;
+	}
+
+	async rebuildFromAllSessions(): Promise<void> {
+		const entries: PromptHistoryEntry[] = [];
+		const sessions = await SessionManager.listAll();
+
+		for (const session of sessions) {
+			entries.push(...extractUserPromptEntriesFromSessionFile(session.path, session.cwd));
+		}
+
+		this.entries = this.dedupeIndexedEntries(entries);
+		this.sortNewestFirst();
+		this.save();
+	}
+
+	add(text: string, cwd?: string, session?: { sessionFile?: string; sessionId?: string }, options?: { persist?: boolean }): boolean {
+		const entry = this.normalizeEntry({
+			text,
+			timestamp: Date.now(),
+			cwd: cwd ?? this.activeCwd,
+			sessionFile: session?.sessionFile ?? this.activeSessionFile,
+			sessionId: session?.sessionId ?? this.activeSessionId,
+		});
+		if (!entry) return false;
+
+		this.entries.push(entry);
+		this.sortNewestFirst();
 		if (options?.persist !== false) this.save();
 		return true;
 	}
 
-	addMany(texts: string[], cwd?: string): void {
+	addEntries(entries: PromptHistoryEntry[], options?: { persist?: boolean }): void {
 		let changed = false;
-		for (const text of texts) {
-			changed = this.add(text, cwd, { persist: false }) || changed;
+		for (const entry of entries) {
+			const normalized = this.normalizeEntry(entry);
+			if (!normalized || this.hasIndexedEntry(normalized)) continue;
+			this.entries.push(normalized);
+			changed = true;
 		}
-		if (changed) this.save();
+
+		if (!changed) return;
+		this.sortNewestFirst();
+		if (options?.persist !== false) this.save();
 	}
 
 	search(query: string, exclude?: string): string[] {
 		const needle = query.trim().toLowerCase();
-		const excludeNormalized = exclude ? this.normalize(exclude) : undefined;
+		const excludeNormalized = exclude ? this.normalizeText(exclude) : undefined;
 		const seen = new Set<string>();
 		const result: string[] = [];
 
-		for (let i = this.entries.length - 1; i >= 0; i--) {
-			const text = this.entries[i]?.text;
+		for (const entry of this.scopedEntries()) {
+			const text = entry.text;
 			if (!text || text === excludeNormalized || seen.has(text)) continue;
 			if (needle && !text.toLowerCase().includes(needle)) continue;
 			seen.add(text);
@@ -81,52 +155,135 @@ class PromptHistoryStore {
 		return this.search("");
 	}
 
+	getScopeLabel(): string {
+		return this.config.scope === "current-session" ? "current session" : "all sessions";
+	}
+
+	count(): number {
+		return this.entries.length;
+	}
+
 	clear(): void {
 		this.entries = [];
 		try {
-			fs.rmSync(this.file, { force: true });
+			fs.rmSync(this.indexFile, { force: true });
 		} catch {
 			// Ignore.
 		}
 	}
 
-	private normalize(text: string): string {
+	private scopedEntries(): PromptHistoryEntry[] {
+		if (this.config.scope !== "current-session") return this.entries;
+		if (this.activeSessionFile) return this.entries.filter((entry) => entry.sessionFile === this.activeSessionFile);
+		if (this.activeSessionId) return this.entries.filter((entry) => entry.sessionId === this.activeSessionId);
+		return [];
+	}
+
+	private normalizeText(text: string): string {
 		return text.replace(/\r\n?/g, "\n").trim();
 	}
 
-	private trim(): void {
-		if (this.entries.length > MAX_HISTORY) {
-			this.entries = this.entries.slice(this.entries.length - MAX_HISTORY);
+	private normalizeEntry(entry: PromptHistoryEntry): PromptHistoryEntry | undefined {
+		const text = this.normalizeText(entry.text);
+		if (!text) return undefined;
+
+		return {
+			text,
+			timestamp: Number.isFinite(entry.timestamp) ? entry.timestamp : Date.now(),
+			cwd: typeof entry.cwd === "string" && entry.cwd.length > 0 ? entry.cwd : undefined,
+			sessionFile: typeof entry.sessionFile === "string" && entry.sessionFile.length > 0 ? entry.sessionFile : undefined,
+			sessionId: typeof entry.sessionId === "string" && entry.sessionId.length > 0 ? entry.sessionId : undefined,
+			entryId: typeof entry.entryId === "string" && entry.entryId.length > 0 ? entry.entryId : undefined,
+		};
+	}
+
+	private hasIndexedEntry(entry: PromptHistoryEntry): boolean {
+		if (entry.sessionFile && entry.entryId) {
+			return this.entries.some((existing) => existing.sessionFile === entry.sessionFile && existing.entryId === entry.entryId);
 		}
+		if (entry.sessionId && entry.entryId) {
+			return this.entries.some((existing) => existing.sessionId === entry.sessionId && existing.entryId === entry.entryId);
+		}
+		return false;
+	}
+
+	private dedupeIndexedEntries(entries: PromptHistoryEntry[]): PromptHistoryEntry[] {
+		const seen = new Set<string>();
+		const result: PromptHistoryEntry[] = [];
+
+		for (const entry of entries) {
+			const normalized = this.normalizeEntry(entry);
+			if (!normalized) continue;
+			const key = indexedEntryKey(normalized);
+			if (key && seen.has(key)) continue;
+			if (key) seen.add(key);
+			result.push(normalized);
+		}
+
+		return result;
+	}
+
+	private sortNewestFirst(): void {
+		this.entries.sort((a, b) => b.timestamp - a.timestamp);
 	}
 
 	private load(): void {
 		try {
-			if (!fs.existsSync(this.file)) return;
-			const parsed = JSON.parse(fs.readFileSync(this.file, "utf-8")) as Partial<PromptHistoryFile>;
-			if (!Array.isArray(parsed.entries)) return;
-			this.entries = parsed.entries
-				.filter((entry): entry is PromptHistoryEntry => typeof entry?.text === "string" && entry.text.trim().length > 0)
-				.map((entry) => ({
-					text: this.normalize(entry.text),
-					timestamp: typeof entry.timestamp === "number" ? entry.timestamp : Date.now(),
-					cwd: typeof entry.cwd === "string" ? entry.cwd : undefined,
-				}));
-			this.trim();
+			if (!fs.existsSync(this.indexFile)) {
+				this.entries = [];
+				return;
+			}
+
+			this.entries = this.loadJsonlIndexEntries();
+			this.sortNewestFirst();
 		} catch {
 			this.entries = [];
 		}
 	}
 
+	private loadJsonlIndexEntries(): PromptHistoryEntry[] {
+		try {
+			const entries: PromptHistoryEntry[] = [];
+			const lines = fs.readFileSync(this.indexFile, "utf-8").split("\n");
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				const record = JSON.parse(line) as Partial<PromptHistoryIndexRecord>;
+				if (record.type !== "message") continue;
+				entries.push(record as PromptHistoryEntry);
+			}
+			return this.dedupeIndexedEntries(entries);
+		} catch {
+			return [];
+		}
+	}
+
+
 	private save(): void {
 		try {
-			fs.mkdirSync(path.dirname(this.file), { recursive: true });
-			const payload: PromptHistoryFile = { version: 1, entries: this.entries };
-			const tmp = `${this.file}.${process.pid}.tmp`;
-			fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf-8");
-			fs.renameSync(tmp, this.file);
+			fs.mkdirSync(path.dirname(this.indexFile), { recursive: true });
+			const now = Date.now();
+			const createdAt = this.loadCreatedAt() ?? now;
+			const records: PromptHistoryIndexRecord[] = [
+				{ type: "meta", version: 3, createdAt, updatedAt: now },
+				...this.entries.map((entry) => ({ type: "message" as const, ...entry })),
+			];
+			const tmp = `${this.indexFile}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf-8");
+			fs.renameSync(tmp, this.indexFile);
 		} catch {
 			// History is a convenience feature; never break pi if persistence fails.
+		}
+	}
+
+	private loadCreatedAt(): number | undefined {
+		try {
+			if (!fs.existsSync(this.indexFile)) return undefined;
+			const firstLine = fs.readFileSync(this.indexFile, "utf-8").split("\n").find((line) => line.trim());
+			if (!firstLine) return undefined;
+			const record = JSON.parse(firstLine) as Partial<PromptHistoryIndexRecord>;
+			return record.type === "meta" && typeof record.createdAt === "number" ? record.createdAt : undefined;
+		} catch {
+			return undefined;
 		}
 	}
 }
@@ -233,13 +390,14 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 		const match = state.matches[state.selected];
 		const query = state.query.length > 0 ? state.query : "(empty = latest prompts)";
 		const status = match
-			? `reverse prompt search ${state.selected + 1}/${state.matches.length}: ${query}`
-			: `reverse prompt search: ${query} — no match`;
+			? `reverse prompt search [${this.store.getScopeLabel()}] ${state.selected + 1}/${state.matches.length}: ${query}`
+			: `reverse prompt search [${this.store.getScopeLabel()}]: ${query} — no match`;
 		const help = "Enter accept • Esc cancel • Ctrl+R older • Ctrl+S newer";
 
-		const displayLines = state.query
+		const displayLines = (state.query
 			? lines.map((line, index) => (index > 0 && index < lines.length - 1 ? this.highlightQuery(line, state.query) : line))
-			: lines;
+			: lines
+		).map((line) => truncateToWidth(line, width));
 
 		return [
 			...displayLines,
@@ -429,39 +587,106 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 	}
 }
 
-function extractUserPromptsFromSession(ctx: ExtensionContext): string[] {
-	const branch = ctx.sessionManager.getBranch() as unknown[];
-	const prompts: string[] = [];
+function loadConfig(cwd: string): PromptHistoryConfig {
+	const config: PromptHistoryConfig = { ...DEFAULT_CONFIG };
+	applyConfigFile(config, GLOBAL_CONFIG_FILE);
+	applyConfigFile(config, path.join(cwd, PROJECT_CONFIG_FILE));
+	return config;
+}
 
-	for (const entry of branch) {
-		const maybeEntry = entry as { type?: string; message?: { role?: string; content?: unknown } };
-		if (maybeEntry.type !== "message" || maybeEntry.message?.role !== "user") continue;
+function applyConfigFile(config: PromptHistoryConfig, file: string): void {
+	try {
+		if (!fs.existsSync(file)) return;
+		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as { scope?: unknown; searchScope?: unknown };
+		const scope = parsed.scope ?? parsed.searchScope;
+		if (scope === "all" || scope === "all-sessions" || scope === "global") config.scope = "all";
+		if (scope === "current" || scope === "current-session" || scope === "session") config.scope = "current-session";
+	} catch {
+		// Invalid config should not break pi.
+	}
+}
 
-		const content = maybeEntry.message.content;
-		if (typeof content === "string") {
-			prompts.push(content);
-		} else if (Array.isArray(content)) {
-			const text = content
-				.filter((block): block is { type: "text"; text: string } => {
-					const maybeBlock = block as { type?: unknown; text?: unknown };
-					return maybeBlock.type === "text" && typeof maybeBlock.text === "string";
-				})
-				.map((block) => block.text)
-				.join("\n");
-			if (text.trim()) prompts.push(text);
-		}
+function extractUserPromptEntriesFromSession(ctx: ExtensionContext): PromptHistoryEntry[] {
+	return extractUserPromptEntriesFromEntries(ctx.sessionManager.getEntries(), {
+		cwd: ctx.cwd,
+		sessionFile: ctx.sessionManager.getSessionFile(),
+		sessionId: ctx.sessionManager.getSessionId(),
+	});
+}
+
+function extractUserPromptEntriesFromSessionFile(sessionFile: string, fallbackCwd?: string): PromptHistoryEntry[] {
+	try {
+		const fileEntries = parseSessionEntries(fs.readFileSync(sessionFile, "utf-8"));
+		const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		const entries = fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		return extractUserPromptEntriesFromEntries(entries, {
+			cwd: header?.cwd ?? fallbackCwd,
+			sessionFile,
+			sessionId: header?.id,
+		});
+	} catch {
+		return [];
+	}
+}
+
+function extractUserPromptEntriesFromEntries(
+	entries: SessionEntry[],
+	session: { cwd?: string; sessionFile?: string; sessionId?: string },
+): PromptHistoryEntry[] {
+	const prompts: PromptHistoryEntry[] = [];
+
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		const text = extractTextFromUserMessage(entry.message.content);
+		if (!text) continue;
+		prompts.push({
+			text,
+			timestamp: Date.parse(entry.timestamp) || Date.now(),
+			cwd: session.cwd,
+			sessionFile: session.sessionFile,
+			sessionId: session.sessionId,
+			entryId: entry.id,
+		});
 	}
 
 	return prompts;
 }
 
+function extractTextFromUserMessage(content: unknown): string | undefined {
+	if (typeof content === "string") return content.trim() ? content : undefined;
+	if (!Array.isArray(content)) return undefined;
+
+	const text = content
+		.filter((block): block is { type: "text"; text: string } => {
+			const maybeBlock = block as { type?: unknown; text?: unknown };
+			return maybeBlock.type === "text" && typeof maybeBlock.text === "string";
+		})
+		.map((block) => block.text)
+		.join("\n");
+
+	return text.trim() ? text : undefined;
+}
+
+function indexedEntryKey(entry: PromptHistoryEntry): string | undefined {
+	if (entry.sessionFile && entry.entryId) return `file:${entry.sessionFile}:${entry.entryId}`;
+	if (entry.sessionId && entry.entryId) return `session:${entry.sessionId}:${entry.entryId}`;
+	return undefined;
+}
+
 export default function (pi: ExtensionAPI) {
-	const store = new PromptHistoryStore(HISTORY_FILE);
+	const store = new PromptHistoryStore(INDEX_FILE);
 	let previousEditorFactory: CustomEditorFactory | undefined;
 	let installed = false;
 
-	pi.on("session_start", (_event, ctx) => {
-		store.addMany(extractUserPromptsFromSession(ctx), ctx.cwd);
+	pi.on("session_start", async (_event, ctx) => {
+		store.configure(ctx.cwd);
+		store.setActiveSession(ctx);
+
+		const needsIndex = !store.hasIndex();
+		if (needsIndex) ctx.ui.notify("Building prompt history index from existing sessions...", "info");
+		const builtIndex = await store.ensureIndex();
+		store.addEntries(extractUserPromptEntriesFromSession(ctx));
+		if (builtIndex) ctx.ui.notify(`Prompt history indexed ${store.count()} user messages.`, "info");
 
 		if (installed) return;
 		previousEditorFactory = ctx.ui.getEditorComponent();
@@ -476,7 +701,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("input", (event, ctx) => {
 		if (event.source === "extension") return { action: "continue" as const };
-		store.add(event.text, ctx.cwd);
+		store.configure(ctx.cwd);
+		store.setActiveSession(ctx);
+		store.add(event.text, ctx.cwd, {
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			sessionId: ctx.sessionManager.getSessionId(),
+		});
 		return { action: "continue" as const };
 	});
 
@@ -490,14 +720,17 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("prompt-history", {
 		description: "Pick a previous prompt and put it in the editor",
 		handler: async (_args, ctx) => {
+			store.configure(ctx.cwd);
+			store.setActiveSession(ctx);
 			const choices = store.allNewestFirst();
 			if (choices.length === 0) {
-				ctx.ui.notify("No prompt history yet.", "info");
+				ctx.ui.notify(`No prompt history yet for ${store.getScopeLabel()}.`, "info");
 				return;
 			}
 
-			const labels = choices.map((text, index) => `${index + 1}. ${text.split("\n")[0] ?? ""}`);
-			const selected = await ctx.ui.select("Prompt history", labels);
+			const labelWidth = Math.max(20, Math.min(process.stdout.columns || 120, 120) - 8);
+			const labels = choices.map((text, index) => `${index + 1}. ${truncateToWidth(text.split("\n")[0] ?? "", labelWidth)}`);
+			const selected = await ctx.ui.select(`Prompt history (${store.getScopeLabel()})`, labels);
 			if (!selected) return;
 
 			const index = labels.indexOf(selected);
@@ -505,10 +738,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("prompt-history-clear", {
-		description: "Clear the Ctrl+R prompt history file",
+	pi.registerCommand("prompt-history-reindex", {
+		description: "Rebuild the prompt history index from all saved sessions",
 		handler: async (_args, ctx) => {
-			const ok = await ctx.ui.confirm("Clear prompt history?", `Delete ${HISTORY_FILE}?`);
+			store.configure(ctx.cwd);
+			ctx.ui.notify("Rebuilding prompt history index...", "info");
+			await store.rebuildFromAllSessions();
+			store.setActiveSession(ctx);
+			store.addEntries(extractUserPromptEntriesFromSession(ctx));
+			ctx.ui.notify(`Prompt history indexed ${store.count()} user messages.`, "info");
+		},
+	});
+
+	pi.registerCommand("prompt-history-clear", {
+		description: "Clear the Ctrl+R prompt history index",
+		handler: async (_args, ctx) => {
+			const ok = await ctx.ui.confirm("Clear prompt history?", `Delete ${INDEX_FILE}?`);
 			if (!ok) return;
 			store.clear();
 			ctx.ui.notify("Prompt history cleared.", "info");

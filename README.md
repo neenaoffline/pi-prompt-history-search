@@ -13,9 +13,11 @@ Press `Ctrl+R`, type part of an old prompt, and press `Enter` to restore it into
 - `Ctrl+S` / `↓` cycles newer matches.
 - `Enter`, `Tab`, or `→` accepts the selected prompt.
 - `Esc` or `Ctrl+C` cancels and restores the text you had before searching.
-- Prompts are persisted across sessions in `~/.pi/agent/prompt-history.json`.
+- Prompts are indexed across all saved sessions by default in `~/.pi/agent/prompt-history-index.jsonl`.
+- Search scope is configurable: all sessions or only the current session.
+- On first run, existing saved sessions are scanned to build the index.
 - Existing user prompts from the current session are imported on startup.
-- Includes `/prompt-history` and `/prompt-history-clear` commands.
+- Includes `/prompt-history`, `/prompt-history-reindex`, and `/prompt-history-clear` commands.
 
 ## Installation
 
@@ -51,11 +53,28 @@ In interactive pi:
 Slash commands:
 
 - `/prompt-history` — choose a previous prompt from a selector and place it in the editor.
-- `/prompt-history-clear` — delete the persisted history file.
+- `/prompt-history-reindex` — rebuild the prompt history index from saved sessions.
+- `/prompt-history-clear` — delete the persisted history index.
+
+## Configuration
+
+By default, search spans all indexed user messages across saved sessions.
+
+Set global config in `~/.pi/agent/prompt-history-search.json`, or project config in `.pi/prompt-history-search.json`:
+
+```json
+{
+  "scope": "all"
+}
+```
+
+Use `"scope": "current-session"` to search only the active session.
+Project config overrides global config.
 
 ## Notes
 
-- The history file stores prompt text locally at `~/.pi/agent/prompt-history.json`.
+- The index stores one JSONL record per prompt locally at `~/.pi/agent/prompt-history-index.jsonl`.
+- The JSONL index is the only prompt-history index; if it does not exist, it is rebuilt from saved pi session JSONL files.
 - The extension wraps any custom editor that was already configured; if none exists, it uses pi's `CustomEditor`.
 - App-level shortcuts such as `Alt+Enter` follow-ups, model cycling, and tool expansion are forwarded while not in reverse-search mode.
 - This package is marked `private` and `UNLICENSED` so it will not be accidentally published to npm. Change those fields before publishing.
