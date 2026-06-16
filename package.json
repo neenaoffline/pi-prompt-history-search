@@ -1,0 +1,24 @@
+{
+  "name": "pi-prompt-history-search",
+  "version": "0.1.0",
+  "description": "Ctrl+R reverse prompt history search for pi.",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "prompt-history",
+    "reverse-search"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/prompt-history-search.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
