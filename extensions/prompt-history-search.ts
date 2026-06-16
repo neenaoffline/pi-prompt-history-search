@@ -1,7 +1,13 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CustomEditor, type EditorFactory, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+	CustomEditor,
+	type AppKeybinding,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type KeybindingsManager,
+} from "@mariozechner/pi-coding-agent";
 import {
 	Key,
 	matchesKey,
@@ -14,13 +20,13 @@ import {
 
 const HISTORY_FILE = path.join(os.homedir(), ".pi", "agent", "prompt-history.json");
 const MAX_HISTORY = 2000;
-const EXTENSION_ID = "prompt-history-search";
-
 type PromptHistoryEntry = {
 	text: string;
 	timestamp: number;
 	cwd?: string;
 };
+
+type CustomEditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
 
 type PromptHistoryFile = {
 	version: 1;
@@ -126,6 +132,12 @@ class PromptHistoryStore {
 }
 
 class PromptHistoryEditor implements EditorComponent, Focusable {
+	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
+	public onEscape?: () => void;
+	public onCtrlD?: () => void;
+	public onPasteImage?: () => void;
+	public onExtensionShortcut?: (data: string) => boolean;
+
 	private searchState:
 		| {
 				query: string;
@@ -139,6 +151,8 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 		private readonly inner: EditorComponent,
 		private readonly store: PromptHistoryStore,
 		private readonly tui: TUI,
+		private readonly keybindings: KeybindingsManager,
+		private readonly highlight: (text: string) => string,
 	) {}
 
 	get focused(): boolean {
@@ -223,8 +237,12 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 			: `reverse prompt search: ${query} — no match`;
 		const help = "Enter accept • Esc cancel • Ctrl+R older • Ctrl+S newer";
 
+		const displayLines = state.query
+			? lines.map((line, index) => (index > 0 && index < lines.length - 1 ? this.highlightQuery(line, state.query) : line))
+			: lines;
+
 		return [
-			...lines,
+			...displayLines,
 			truncateToWidth(status, width),
 			truncateToWidth(help, width),
 		];
@@ -241,11 +259,57 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 			return;
 		}
 
+		if (this.handleAppKeybinding(data)) return;
+
 		this.inner.handleInput(data);
 	}
 
 	dispose(): void {
 		(this.inner as EditorComponent & { dispose?: () => void }).dispose?.();
+	}
+
+	private handleAppKeybinding(data: string): boolean {
+		if (this.onExtensionShortcut?.(data)) return true;
+
+		if (this.keybindings.matches(data, "app.clipboard.pasteImage")) {
+			this.onPasteImage?.();
+			return true;
+		}
+
+		if (this.keybindings.matches(data, "app.interrupt")) {
+			if (!this.isShowingAutocomplete()) {
+				const handler = this.onEscape ?? this.actionHandlers.get("app.interrupt");
+				if (handler) {
+					handler();
+					return true;
+				}
+			}
+
+			this.inner.handleInput(data);
+			return true;
+		}
+
+		if (this.keybindings.matches(data, "app.exit")) {
+			if (this.getText().length === 0) {
+				const handler = this.onCtrlD ?? this.actionHandlers.get("app.exit");
+				if (handler) handler();
+				return true;
+			}
+		}
+
+		for (const [action, handler] of this.actionHandlers) {
+			if (action !== "app.interrupt" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+				handler();
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private isShowingAutocomplete(): boolean {
+		const editor = this.inner as EditorComponent & { isShowingAutocomplete?: () => boolean };
+		return editor.isShowingAutocomplete?.() ?? false;
 	}
 
 	private startSearch(): void {
@@ -324,6 +388,29 @@ class PromptHistoryEditor implements EditorComponent, Focusable {
 		this.inner.setText(match ?? this.searchState.originalText);
 	}
 
+	private highlightQuery(line: string, query: string): string {
+		const normalizedQuery = query.toLowerCase();
+		if (!normalizedQuery) return line;
+
+		let cursor = 0;
+		let result = "";
+		const lowerLine = line.toLowerCase();
+
+		while (cursor < line.length) {
+			const matchIndex = lowerLine.indexOf(normalizedQuery, cursor);
+			if (matchIndex === -1) {
+				result += line.slice(cursor);
+				break;
+			}
+
+			result += line.slice(cursor, matchIndex);
+			result += this.highlight(line.slice(matchIndex, matchIndex + query.length));
+			cursor = matchIndex + query.length;
+		}
+
+		return result;
+	}
+
 	private acceptSearch(): void {
 		this.searchState = undefined;
 		this.tui.requestRender();
@@ -370,7 +457,7 @@ function extractUserPromptsFromSession(ctx: ExtensionContext): string[] {
 
 export default function (pi: ExtensionAPI) {
 	const store = new PromptHistoryStore(HISTORY_FILE);
-	let previousEditorFactory: EditorFactory | undefined;
+	let previousEditorFactory: CustomEditorFactory | undefined;
 	let installed = false;
 
 	pi.on("session_start", (_event, ctx) => {
@@ -382,9 +469,8 @@ export default function (pi: ExtensionAPI) {
 			const inner = previousEditorFactory
 				? previousEditorFactory(tui, theme, keybindings)
 				: new CustomEditor(tui, theme, keybindings);
-			return new PromptHistoryEditor(inner, store, tui);
+			return new PromptHistoryEditor(inner, store, tui, keybindings, (text) => `\x1b[33m\x1b[1m${text}\x1b[22m\x1b[39m`);
 		});
-		ctx.ui.setStatus(EXTENSION_ID, "Ctrl+R prompt search");
 		installed = true;
 	});
 
@@ -397,7 +483,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		if (installed) {
 			ctx.ui.setEditorComponent(previousEditorFactory);
-			ctx.ui.setStatus(EXTENSION_ID, undefined);
 			installed = false;
 		}
 	});

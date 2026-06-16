@@ -8,6 +8,7 @@ Press `Ctrl+R`, type part of an old prompt, and press `Enter` to restore it into
 
 - `Ctrl+R` opens reverse prompt search in the main pi editor.
 - Type to filter previous prompts by substring.
+- Matching text is highlighted while reverse-search mode is active.
 - `Ctrl+R` / `↑` cycles older matches.
 - `Ctrl+S` / `↓` cycles newer matches.
 - `Enter`, `Tab`, or `→` accepts the selected prompt.
@@ -17,6 +18,12 @@ Press `Ctrl+R`, type part of an old prompt, and press `Enter` to restore it into
 - Includes `/prompt-history` and `/prompt-history-clear` commands.
 
 ## Installation
+
+From GitHub:
+
+```bash
+pi install git:github.com/neenaoffline/pi-prompt-history-search
+```
 
 From this local checkout:
 
@@ -50,7 +57,8 @@ Slash commands:
 
 - The history file stores prompt text locally at `~/.pi/agent/prompt-history.json`.
 - The extension wraps any custom editor that was already configured; if none exists, it uses pi's `CustomEditor`.
-- This package is marked `private` and `UNLICENSED` so it will not be accidentally published. Change those fields before publishing.
+- App-level shortcuts such as `Alt+Enter` follow-ups, model cycling, and tool expansion are forwarded while not in reverse-search mode.
+- This package is marked `private` and `UNLICENSED` so it will not be accidentally published to npm. Change those fields before publishing.
 
 ## Development
 
@@ -60,8 +68,26 @@ Package layout:
 .
 ├── extensions/
 │   └── prompt-history-search.ts
+├── eslint.config.js
+├── flake.nix
 ├── package.json
-└── README.md
+├── README.md
+└── tsconfig.json
+```
+
+With Nix:
+
+```bash
+nix develop
+npm install
+npm run check
+```
+
+Without Nix, use Node.js 22+ and npm:
+
+```bash
+npm install
+npm run check
 ```
 
 Load locally during development:

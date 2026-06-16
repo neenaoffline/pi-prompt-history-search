@@ -12,6 +12,11 @@
     "prompt-history",
     "reverse-search"
   ],
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint"
+  },
   "pi": {
     "extensions": [
       "./extensions/prompt-history-search.ts"
@@ -20,5 +25,14 @@
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.29.0",
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@mariozechner/pi-tui": "^0.73.1",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.29.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.34.1"
   }
 }
