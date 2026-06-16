@@ -5,6 +5,7 @@ import {
 	getAgentDir,
 	parseSessionEntries,
 	SessionManager,
+	SettingsManager,
 	type AppKeybinding,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -673,6 +674,18 @@ function indexedEntryKey(entry: PromptHistoryEntry): string | undefined {
 	return undefined;
 }
 
+function getEditorOptions(cwd: string): { paddingX: number; autocompleteMaxVisible: number } {
+	try {
+		const settings = SettingsManager.create(cwd, AGENT_DIR);
+		return {
+			paddingX: settings.getEditorPaddingX(),
+			autocompleteMaxVisible: settings.getAutocompleteMaxVisible(),
+		};
+	} catch {
+		return { paddingX: 0, autocompleteMaxVisible: 5 };
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const store = new PromptHistoryStore(INDEX_FILE);
 	let previousEditorFactory: CustomEditorFactory | undefined;
@@ -690,10 +703,11 @@ export default function (pi: ExtensionAPI) {
 
 		if (installed) return;
 		previousEditorFactory = ctx.ui.getEditorComponent();
+		const editorOptions = getEditorOptions(ctx.cwd);
 		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 			const inner = previousEditorFactory
 				? previousEditorFactory(tui, theme, keybindings)
-				: new CustomEditor(tui, theme, keybindings);
+				: new CustomEditor(tui, theme, keybindings, editorOptions);
 			return new PromptHistoryEditor(inner, store, tui, keybindings, (text) => `\x1b[33m\x1b[1m${text}\x1b[22m\x1b[39m`);
 		});
 		installed = true;
